@@ -3,7 +3,7 @@ use std::ffi::{c_char, c_void, CStr, CString};
 use std::mem;
 use std::path::PathBuf;
 use std::ptr;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 const PIPER_ESPEAKNG_DATA_DIRECTORY: &str = "PIPER_ESPEAKNG_DATA_DIRECTORY";
 const ESPEAKNG_DATA_DIR_NAME: &str = "espeak-ng-data";
@@ -22,6 +22,13 @@ impl std::fmt::Display for ESpeakError {
 pub type ESpeakResult<T> = Result<T, ESpeakError>;
 
 static ESPEAK_INIT: OnceLock<ESpeakResult<()>> = OnceLock::new();
+
+/// espeak-ng is not thread-safe: the selected voice, the clause cursor and the
+/// buffer `espeak_TextToPhonemes` returns are all process-wide. Two threads
+/// phonemizing at once corrupt each other - observed as segfaults, and as wrong
+/// phonemes, when several `Piper` instances synthesize in parallel. Every call
+/// into espeak-ng after initialisation happens under this lock.
+static ESPEAK_LOCK: Mutex<()> = Mutex::new(());
 
 fn init_espeak() -> ESpeakResult<()> {
     let data_dir = locate_espeak_data();
@@ -113,6 +120,13 @@ pub fn text_to_phonemes(
 
     let lang_cstr = CString::new(language)
         .map_err(|_| ESpeakError("Language name contains a null byte".into()))?;
+
+    // Held until the last clause has been copied out: the voice is global, and
+    // each result points into espeak's static buffer. Nothing here panics
+    // between espeak calls in a way that leaves espeak half-updated, so a
+    // poisoned lock is recovered rather than propagated.
+    let _espeak = ESPEAK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
     let set_voice = unsafe { espeak_rs_sys::espeak_SetVoiceByName(lang_cstr.as_ptr()) };
     if set_voice != espeak_rs_sys::espeak_ERROR_EE_OK {
         return Err(ESpeakError(format!("Failed to set voice: `{language}`")));
@@ -140,8 +154,12 @@ pub fn text_to_phonemes(
                     espeak_rs_sys::espeakCHARS_UTF8 as i32,
                     phoneme_mode,
                 );
+                // espeak returns null only when decoding the input fails, and
+                // does so before advancing `text_ptr` - so `continue` here
+                // retried the same clause forever. Seen as a hung render when
+                // espeak's shared state was corrupted by a concurrent caller.
                 if res.is_null() {
-                    continue;
+                    break;
                 }
                 CStr::from_ptr(res).to_string_lossy().into_owned()
             };
@@ -177,6 +195,33 @@ mod tests {
 
     const TEXT_ALICE: &str =
         "Who are you? said the Caterpillar. Replied Alice , rather shyly, I hardly know, sir!";
+
+    #[test]
+    fn test_concurrent_callers_get_their_own_phonemes() -> ESpeakResult<()> {
+        // espeak-ng's state is process-wide. Without ESPEAK_LOCK this crashes
+        // or returns another thread's phonemes within a few iterations.
+        let cases: [(&str, Option<char>); 3] =
+            [("test", None), (TEXT_ALICE, None), ("test", Some('_'))];
+        let want: Vec<Vec<String>> = cases
+            .iter()
+            .map(|(t, sep)| text_to_phonemes(t, "en-US", *sep))
+            .collect::<ESpeakResult<_>>()?;
+
+        std::thread::scope(|s| {
+            for worker in 0..8 {
+                let (cases, want) = (&cases, &want);
+                s.spawn(move || {
+                    for i in 0..50 {
+                        let k = (worker + i) % cases.len();
+                        let (text, sep) = cases[k];
+                        let got = text_to_phonemes(text, "en-US", sep).unwrap();
+                        assert_eq!(got, want[k], "worker {worker}, iteration {i}");
+                    }
+                });
+            }
+        });
+        Ok(())
+    }
 
     #[test]
     fn test_basic_en() -> ESpeakResult<()> {

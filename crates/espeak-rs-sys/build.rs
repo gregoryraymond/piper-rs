@@ -384,6 +384,13 @@ fn main() {
         println!("cargo:rustc-link-lib=dylib=msvcrtd");
     }
 
+    // espeak_ng_InitializePath reads the install path from the registry.
+    // Binaries that link anything else from Win32 get advapi32 by accident;
+    // espeak-rs's own tests do not, and fail on RegOpenKeyExA.
+    if target_os() == "windows" {
+        println!("cargo:rustc-link-lib=dylib=advapi32");
+    }
+
     // Linux
     if target_os() == "linux" {
         println!("cargo:rustc-link-lib=dylib=stdc++");
