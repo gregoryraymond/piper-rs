@@ -12,6 +12,28 @@ macro_rules! debug_log {
     };
 }
 
+/// `cfg!(target_os = ...)` inside a build script reports the machine doing the
+/// BUILDING, not the machine being built for, so it silently takes the wrong
+/// branch whenever the two differ. Cargo exposes the real target here.
+fn target_os() -> String {
+    env::var("CARGO_CFG_TARGET_OS").unwrap_or_default()
+}
+
+/// The NDK sysroot, when building for Android. bindgen and CMake both need it;
+/// without it bindgen reads the host's /usr/include and generates bindings with
+/// host-sized types.
+fn android_ndk_root() -> Option<std::path::PathBuf> {
+    for k in ["ANDROID_NDK_ROOT", "ANDROID_NDK_HOME", "NDK_HOME"] {
+        if let Ok(v) = env::var(k) {
+            let p = std::path::PathBuf::from(v);
+            if p.is_dir() {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
 fn get_cargo_target_dir() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
     let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR")?);
     let profile = std::env::var("PROFILE")?;
@@ -52,7 +74,7 @@ fn copy_folder(src: &Path, dst: &Path) {
 fn extract_lib_names(out_dir: &Path, build_shared_libs: bool) -> Vec<String> {
     let lib_pattern = if cfg!(windows) {
         "*.lib"
-    } else if cfg!(target_os = "macos") {
+    } else if target_os() == "macos" {
         if build_shared_libs {
             "*.dylib"
         } else {
@@ -95,7 +117,7 @@ fn extract_lib_names(out_dir: &Path, build_shared_libs: bool) -> Vec<String> {
 fn extract_lib_assets(out_dir: &Path) -> Vec<PathBuf> {
     let shared_lib_pattern = if cfg!(windows) {
         "*.dll"
-    } else if cfg!(target_os = "macos") {
+    } else if target_os() == "macos" {
         "*.dylib"
     } else {
         "*.so"
@@ -170,7 +192,11 @@ fn main() {
     debug_log!("BUILD_SHARED: {}", build_shared_libs);
 
     // Prepare espeak-ng source
-    if !espeak_dst.exists() {
+    // Check for a FILE the copy must have produced, not merely the directory:
+    // copy_folder create_dir_all's the destination before copying, so a run that
+    // fails afterwards leaves an empty directory that makes every later run skip
+    // the copy and then fail in CMake with "does not contain CMakeLists.txt".
+    if !espeak_dst.join("CMakeLists.txt").exists() {
         debug_log!("Copy {} to {}", espeak_src.display(), espeak_dst.display());
         copy_folder(&espeak_src, &espeak_dst);
     }
@@ -184,16 +210,51 @@ fn main() {
     );
 
     // Bindings
-    let bindings = bindgen::Builder::default()
+    let mut builder = bindgen::Builder::default()
         .header("wrapper.h")
         .clang_arg(format!("-I{}", espeak_dst.display()))
         .clang_arg(format!(
             "-I{}",
             espeak_dst.join("src").join("include").display()
         ))
-        .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
-        .generate()
-        .expect("Failed to generate bindings");
+        // wrapper.h's quoted includes resolve relative to wrapper.h itself, i.e.
+        // into the SOURCE tree, not the OUT_DIR copy. The headers it pulls in
+        // then use angle-bracket includes (<espeak-ng/speak_lib.h>), which only
+        // search -I paths - so the source tree needs to be on that list too, or
+        // the second hop fails with "file not found" even though the first
+        // resolved fine.
+        .clang_arg(format!("-I{}", espeak_src.display()))
+        .clang_arg(format!(
+            "-I{}",
+            espeak_src.join("src").join("include").display()
+        ))
+        .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()));
+
+    // Cross-compiling: bindgen shells out to libclang, which defaults to the
+    // HOST triple and host headers. Left alone it derives host-sized types and
+    // fails with "Target platform requires `--no-size_t-is-usize`. The size of
+    // `ssize_t` (4) does not match the target pointer size (8)".
+    if target != env::var("HOST").unwrap_or_default() {
+        builder = builder
+            .clang_arg(format!("--target={target}"))
+            .size_t_is_usize(false);
+
+        if target_os() == "android" {
+            let ndk = android_ndk_root().expect(
+                "building for Android requires ANDROID_NDK_ROOT (or ANDROID_NDK_HOME) \
+                 pointing at an NDK installation",
+            );
+            let sysroot = ndk
+                .join("toolchains")
+                .join("llvm")
+                .join("prebuilt")
+                .join(format!("{}-x86_64", env::consts::OS))
+                .join("sysroot");
+            builder = builder.clang_arg(format!("--sysroot={}", sysroot.display()));
+        }
+    }
+
+    let bindings = builder.generate().expect("Failed to generate bindings");
 
     // Write the generated bindings to an output file
     let bindings_path = out_dir.join("bindings.rs");
@@ -218,8 +279,43 @@ fn main() {
         config.static_crt(static_crt);
     }
 
-    if cfg!(target_os = "macos") {
+    if target_os() == "macos" {
         config.define("USE_LIBPCAUDIO", "OFF");
+    }
+
+    if target_os() == "android" {
+        let ndk =
+            android_ndk_root().expect("building for Android requires ANDROID_NDK_ROOT to be set");
+        let abi = match target.split('-').next().unwrap_or("") {
+            "aarch64" => "arm64-v8a",
+            "armv7" | "thumbv7neon" => "armeabi-v7a",
+            "x86_64" => "x86_64",
+            "i686" => "x86",
+            other => panic!("unsupported Android arch: {other}"),
+        };
+        // The NDK ships its own CMake toolchain file; without it CMake probes
+        // the host compiler and produces host objects that fail to link.
+        config
+            .define(
+                "CMAKE_TOOLCHAIN_FILE",
+                ndk.join("build")
+                    .join("cmake")
+                    .join("android.toolchain.cmake"),
+            )
+            .define("ANDROID_ABI", abi)
+            .define("ANDROID_PLATFORM", "android-24")
+            // No pcaudio on Android - the app plays through oboe, and espeak-ng
+            // only needs to synthesise into a buffer.
+            .define("USE_LIBPCAUDIO", "OFF")
+            .define("USE_ASYNC", "OFF")
+            // The NDK's clang turns on fortify diagnostics that espeak-ng's
+            // build treats as fatal, so an upstream warning
+            // ("'strcpy' called with string bigger than buffer" in speech.c)
+            // stops the build. These are pre-existing upstream findings, not
+            // something this port introduces, so downgrade them rather than
+            // patching vendored C we do not maintain.
+            .define("CMAKE_C_FLAGS", "-Wno-error")
+            .define("CMAKE_CXX_FLAGS", "-Wno-error");
     }
 
     // General
@@ -263,7 +359,7 @@ fn main() {
     }
 
     // macOS
-    if cfg!(target_os = "macos") {
+    if target_os() == "macos" {
         println!("cargo:rustc-link-lib=framework=Foundation");
         println!("cargo:rustc-link-lib=c++");
     }
@@ -289,7 +385,7 @@ fn main() {
     }
 
     // Linux
-    if cfg!(target_os = "linux") {
+    if target_os() == "linux" {
         println!("cargo:rustc-link-lib=dylib=stdc++");
     }
 
