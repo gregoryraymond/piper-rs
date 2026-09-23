@@ -15,7 +15,11 @@
 > 1. **`cfg!(target_os = ...)` was used in five places.** Inside a build script
 >    `cfg!` reports the machine doing the *building*, not the target, so every
 >    one of those branches took the wrong path when cross-compiling. Now reads
->    `CARGO_CFG_TARGET_OS`.
+>    `CARGO_CFG_TARGET_OS`. `cfg!(windows)` had the same flaw in five more
+>    places: from a Windows host it linked the MSVC debug runtime into Android
+>    builds (`ld.lld: error: unable to find library -lmsvcrtd`). Those now check
+>    the target too; only the `robocopy`/`cp` choice stays on the host, because
+>    that one runs on the host.
 > 2. **bindgen was never told the target.** It read the host's `/usr/include`
 >    while generating bindings for aarch64, which fails with:
 >    `Target platform requires --no-size_t-is-usize. The size of ssize_t (4) does

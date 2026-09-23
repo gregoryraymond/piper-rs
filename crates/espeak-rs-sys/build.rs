@@ -72,7 +72,7 @@ fn copy_folder(src: &Path, dst: &Path) {
 }
 
 fn extract_lib_names(out_dir: &Path, build_shared_libs: bool) -> Vec<String> {
-    let lib_pattern = if cfg!(windows) {
+    let lib_pattern = if target_os() == "windows" {
         "*.lib"
     } else if target_os() == "macos" {
         if build_shared_libs {
@@ -115,7 +115,7 @@ fn extract_lib_names(out_dir: &Path, build_shared_libs: bool) -> Vec<String> {
 }
 
 fn extract_lib_assets(out_dir: &Path) -> Vec<PathBuf> {
-    let shared_lib_pattern = if cfg!(windows) {
+    let shared_lib_pattern = if target_os() == "windows" {
         "*.dll"
     } else if target_os() == "macos" {
         "*.dylib"
@@ -275,7 +275,7 @@ fn main() {
         if build_shared_libs { "ON" } else { "OFF" },
     );
 
-    if cfg!(windows) {
+    if target_os() == "windows" {
         config.static_crt(static_crt);
     }
 
@@ -347,7 +347,7 @@ fn main() {
     );
     println!("cargo:rustc-link-search={}", bindings_dir.display());
 
-    if cfg!(windows) {
+    if target_os() == "windows" {
         println!(
             "cargo:rustc-link-search={}",
             out_dir.join("build/src/speechPlayer/Release").display()
@@ -380,7 +380,7 @@ fn main() {
     }
 
     // Windows debug
-    if cfg!(all(debug_assertions, windows)) {
+    if cfg!(debug_assertions) && target.contains("msvc") {
         println!("cargo:rustc-link-lib=dylib=msvcrtd");
     }
 

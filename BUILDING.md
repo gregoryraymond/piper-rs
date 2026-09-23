@@ -50,6 +50,22 @@ cargo build --target aarch64-linux-android
 does not ship — hence the explicit `CC_*`/`CXX_*` above. Without them the build
 fails with `failed to find tool "aarch64-linux-android-clang++"`.
 
+### From a Windows host
+
+The same, with three differences:
+
+- The NDK prebuilt directory is `windows-x86_64`, and the compiler wrappers are
+  `.cmd` files: `aarch64-linux-android24-clang.cmd`, `…-clang++.cmd`, and
+  `llvm-ar.exe`.
+- Set `CMAKE_GENERATOR=Ninja` and put `ninja` on `PATH`. CMake otherwise picks
+  the Visual Studio generator, which cannot drive the NDK toolchain and fails
+  with `The BaseOutputPath/OutputPath property is not set for project
+  'VCTargetsPath.vcxproj'`. Visual Studio Build Tools ships a ninja under
+  `Common7/IDE/CommonExtensions/Microsoft/CMake/Ninja/`.
+- `LIBCLANG_PATH` must point at a regular LLVM install. If another toolchain
+  (e.g. esp-rs's Xtensa clang) has set it globally, bindgen fails with
+  `Unable to find libclang`.
+
 ### Keep the checkout path short
 
 espeak-ng does `strcpy(path_home, PATH_ESPEAK_DATA)` into a fixed **160–230
